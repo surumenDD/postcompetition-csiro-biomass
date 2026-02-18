@@ -2,7 +2,7 @@
 (https://www.kaggle.com/competitions/csiro-biomass)
 ---
 ## 環境構築
-```
+```bash
 # 本リポジトリをクローンする
 git clone git@github.com:surumenDD/postcompetition-csiro-biomass.git
 # uv のインストール
