@@ -1,4 +1,4 @@
-# Kaggleコンペティション  CSIRO - Image2Biomass Prediction  における、上位解法の再現実装を試みるリポジトリである
+# Kaggleコンペティション<br>CSIRO - Image2Biomass Predictionにおける、上位解法の再現実装を試みるリポジトリである
 (https://www.kaggle.com/competitions/csiro-biomass)
 ---
 ## 環境構築
