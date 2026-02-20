@@ -192,6 +192,51 @@ def make_train_wide(train_csv_path: Path) -> pd.DataFrame:
     return train_csv_wide_df
 
 
+def get_transforms(img_size: int, is_train: bool) -> A.Compose:
+    if is_train:
+        return A.Compose([
+            A.Resize(img_size, img_size),
+            A.HorizontalFlip(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.5),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ])
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+
+class BiomassDataset(Dataset):
+    """1000×2000 画像を left/right に分割して返す"""
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        img_root: Path,
+        transform: A.Compose,
+        target_cols: List[str],
+    ):
+        self.df = df.reset_index(drop=True)
+        self.img_root = Path(img_root)
+        self.transform = transform
+        self.targets = np.log1p(df[target_cols].values.astype(np.float32))
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_path = self.img_root / self.df.loc[idx, "image_path"]
+        img = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_BGR2RGB)
+        left = img[:, :1000, :]   # (1000, 1000, 3)
+        right = img[:, 1000:, :]   # (1000, 1000, 3)
+        left_t = self.transform(image=left)["image"]
+        right_t = self.transform(image=right)["image"]
+        targets = torch.tensor(self.targets[idx], dtype=torch.float32)
+        return left_t, right_t, targets
+
+
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg: Config) -> None:
     # 各pathの設定
