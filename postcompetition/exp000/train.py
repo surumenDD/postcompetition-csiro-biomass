@@ -192,6 +192,69 @@ def make_train_wide(train_csv_path: Path) -> pd.DataFrame:
     return train_csv_wide_df
 
 
+class SpatialAttentionPool(nn.Module):
+    """patch tokens 上の soft attention weight を学習し空間的特徴を抽出する。
+    attn_weights を reshape すると空間的重要度マップ（密度マップ相当）として可視化可能。"""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.attn = nn.Linear(embed_dim, 1)
+
+    def forward(self, patch_tokens: torch.Tensor):
+        # patch_tokens: (B, N_patches, D)
+        attn_weights = self.attn(patch_tokens).softmax(dim=1)  # (B, N, 1)
+        pooled = (patch_tokens * attn_weights).sum(dim=1)       # (B, D)
+        return pooled, attn_weights
+
+
+class DualStreamDINOv3Regressor(nn.Module):
+    NUM_PREFIX_TOKENS = 5  # 1 CLS + 4 Register (DINOv3 固定)
+
+    def __init__(
+        self,
+        model_name: str,
+        num_targets: int = 5,
+        fusion_hidden_dim: int = 512,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        self.backbone = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=0, global_pool=''
+        )
+        # バックボーン全体を freeze
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        D = self.backbone.num_features  # 384 for ViT-Small
+        self.spatial_pool_left = SpatialAttentionPool(D)
+        self.spatial_pool_right = SpatialAttentionPool(D)
+        # 2ストリーム × (CLS + spatial_pool) = 4D → fusion_hidden_dim
+        self.fusion_trunk = nn.Sequential(
+            nn.Linear(D * 4, fusion_hidden_dim),
+            nn.GELU(),
+        )
+        # ターゲットごとに独立したヘッド
+        self.target_heads = nn.ModuleList([
+            nn.Linear(fusion_hidden_dim, 1) for _ in range(num_targets)
+        ])
+
+    def _encode(self, x: torch.Tensor, spatial_pool: SpatialAttentionPool):
+        feat = self.backbone.forward_features(x)          # (B, 5+N, D)
+        cls = feat[:, 0, :]                           # (B, D)
+        patches = feat[:, self.NUM_PREFIX_TOKENS:, :]     # (B, N, D)
+        spatial, attn = spatial_pool(patches)             # (B, D), (B, N, 1)
+        return cls, spatial, attn
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        cls_L, sp_L, _ = self._encode(left,  self.spatial_pool_left)
+        cls_R, sp_R, _ = self._encode(right, self.spatial_pool_right)
+        fused = torch.cat([cls_L, sp_L, cls_R, sp_R], dim=-1)  # (B, D*4)
+        # (B, hidden_dim)
+        trunk = self.fusion_trunk(fused)
+        # 各ヘッドの出力を concat → (B, num_targets)
+        return torch.cat([h(trunk) for h in self.target_heads], dim=-1)
+
+
 def get_transforms(img_size: int, is_train: bool) -> A.Compose:
     if is_train:
         return A.Compose([
