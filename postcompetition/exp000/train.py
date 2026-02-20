@@ -87,6 +87,59 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def weighted_r2_score(
+    true_target_matrix: np.ndarray,
+    predicted_target_matrix: np.ndarray,
+) -> Tuple[float, np.ndarray]:
+    """
+    shape: (num_samples, 5)
+    targets = [Green, Clover, Dead, GDM, Total]
+
+    Returns
+    -------
+    weighted_r2_score_value : float
+        各ターゲットR²を重み付き平均したスコア
+    per_target_r2_scores : np.ndarray
+        ターゲットごとのR²
+    """
+    # 各ターゲットの重要度（コンペ評価仕様に合わせた重み）
+    target_importance_weights = np.array(
+        [0.1, 0.1, 0.1, 0.2, 0.5],
+        dtype=np.float64,
+    )
+    # 各ターゲットのR²を格納
+    per_target_r2_scores = []
+    # 列方向（=ターゲット単位）にR²を計算
+    num_targets = true_target_matrix.shape[1]
+
+    for target_index in range(num_targets):
+        # 全サンプルにおける1ターゲット分の値を取り出す
+        target_true_values = true_target_matrix[:, target_index]
+        target_predicted_values = predicted_target_matrix[:, target_index]
+        # 残差平方和 Σ(y - ŷ)^2
+        residual_sum_of_squares = np.sum(
+            (target_true_values - target_predicted_values) ** 2
+        )
+        # 全変動 Σ(y - mean(y))^2
+        total_sum_of_squares = np.sum(
+            (target_true_values - np.mean(target_true_values)) ** 2
+        )
+        # R²計算
+        target_r2_score = (
+            1.0 - residual_sum_of_squares / total_sum_of_squares
+            if total_sum_of_squares > 0
+            else 0.0  # 分散0（定数ターゲット）の場合の安全処理
+        )
+        per_target_r2_scores.append(target_r2_score)
+
+    per_target_r2_scores = np.array(per_target_r2_scores)
+    # 重み付き平均R²
+    weighted_r2_score_value = np.sum(
+        per_target_r2_scores * target_importance_weights
+    ) / np.sum(target_importance_weights)
+    return weighted_r2_score_value, per_target_r2_scores
+
+
 def make_clover_dead_stratified_folds(df: pd.DataFrame, n_folds: int, seed: int) -> pd.DataFrame:
     """Clover/Deadの存在有無で層化した StratifiedGroupKFold を作成する。"""
     df["clover_dead_presence"] = (
