@@ -1,10 +1,15 @@
 import os
 import sys
+import cv2
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 import hydra
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
@@ -12,10 +17,23 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from sklearn.model_selection import StratifiedGroupKFold
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 from utils.env import EnvConfig
 from utils.logger import get_logger
 from utils.timing import measure_time_and_memory, timer
+
+TARGET_COLS = [
+    "Dry_Green_g",
+    "Dry_Clover_g",
+    "Dry_Dead_g",
+    "GDM_g",
+    "Dry_Total_g",
+]
+TARGET_WEIGHTS = [0.1, 0.1, 0.1, 0.2, 0.5]
+
 
 META_COLS = [
     "sample_id_prefix",
