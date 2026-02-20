@@ -255,6 +255,34 @@ class DualStreamDINOv3Regressor(nn.Module):
         return torch.cat([h(trunk) for h in self.target_heads], dim=-1)
 
 
+class GradualUnfreezeCallback(pl.Callback):
+    def __init__(self, unfreeze_epoch: int, unfreeze_ratio: float, backbone_lr: float):
+        self.unfreeze_epoch = unfreeze_epoch
+        self.unfreeze_ratio = unfreeze_ratio
+        self.backbone_lr = backbone_lr
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.current_epoch != self.unfreeze_epoch:
+            return
+        blocks = pl_module.model.backbone.blocks   # nn.ModuleList (depth=12)
+        n_unfreeze = int(len(blocks) * self.unfreeze_ratio)
+        # 出力側（末尾）n_unfreeze ブロック + 最終 norm を unfreeze
+        target_modules = list(blocks[-n_unfreeze:]) + \
+            [pl_module.model.backbone.norm]
+        new_params = [p for m in target_modules for p in m.parameters()]
+        for p in new_params:
+            p.requires_grad = True
+        trainer.optimizers[0].add_param_group(
+            {"params": new_params, "lr": self.backbone_lr}
+        )
+        print(
+            f"[GradualUnfreeze] Epoch {trainer.current_epoch}: "
+            f"unfreezing last {n_unfreeze}/{len(blocks)} blocks "
+            f"+ norm with lr={self.backbone_lr:.2e}"
+        )
+        trainer.strategy.barrier()
+
+
 def get_transforms(img_size: int, is_train: bool) -> A.Compose:
     if is_train:
         return A.Compose([
