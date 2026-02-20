@@ -50,6 +50,20 @@ META_COLS = [
 class ExpConfig:
     seed: int = 42
     n_folds: int = 4
+    # Model
+    model_name: str = "vit_small_patch16_dinov3_qkvb.lvd1689m"
+    img_size: int = 448          # 448/16=28 → 28×28=784 patches
+    # Training
+    batch_size: int = 16
+    num_epochs: int = 20
+    num_workers: int = 4
+    lr: float = 1e-3
+    backbone_lr_ratio: float = 0.1
+    # Progressive unfreeze
+    unfreeze_epoch: int = 5
+    unfreeze_ratio: float = 0.5
+    # Fusion head
+    fusion_hidden_dim: int = 512
 
 
 @dataclass
