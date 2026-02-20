@@ -283,6 +283,69 @@ class GradualUnfreezeCallback(pl.Callback):
         trainer.strategy.barrier()
 
 
+class BiomassModule(pl.LightningModule):
+    def __init__(self, model: DualStreamDINOv3Regressor, cfg: "Config"):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+        self.register_buffer(
+            "target_weights",
+            torch.tensor(TARGET_WEIGHTS, dtype=torch.float32)
+        )
+        self._val_preds: List[np.ndarray] = []
+        self._val_targets: List[np.ndarray] = []
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        return self.model(left, right)
+
+    def _weighted_loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """ターゲットごとの SmoothL1Loss を評価重みで加重平均する。"""
+        per_target_loss = torch.stack([
+            nn.functional.smooth_l1_loss(pred[:, i], y[:, i])
+            for i in range(pred.shape[1])
+        ])  # (5,)
+        return (per_target_loss * self.target_weights).sum()
+
+    def training_step(self, batch, _):
+        left, right, y = batch
+        pred = self(left, right)
+        loss = self._weighted_loss(pred, y)
+        self.log("train_loss", loss, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, _):
+        left, right, y = batch
+        pred = self(left, right)
+        loss = self._weighted_loss(pred, y)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        # OOF 収集（log1p 逆変換して評価）
+        self._val_preds.append(torch.expm1(pred).cpu().numpy())
+        self._val_targets.append(torch.expm1(y).cpu().numpy())
+
+    def on_validation_epoch_end(self):
+        preds = np.concatenate(self._val_preds,   axis=0)
+        targets = np.concatenate(self._val_targets, axis=0)
+        score, _ = weighted_r2_score(targets, preds)
+        self.log("val_weighted_r2", score, prog_bar=True)
+        self._val_preds.clear()
+        self._val_targets.clear()
+
+    def predict_step(self, batch, batch_idx):
+        left, right, y = batch
+        pred = self(left, right)
+        return torch.expm1(pred).cpu().numpy(), torch.expm1(y).cpu().numpy()
+
+    def configure_optimizers(self):
+        # 初期は backbone 以外（spatial_pool, trunk, 各ヘッド）のみ学習
+        trainable_params = (
+            list(self.model.spatial_pool_left.parameters())
+            + list(self.model.spatial_pool_right.parameters())
+            + list(self.model.fusion_trunk.parameters())
+            + list(self.model.target_heads.parameters())
+        )
+        return torch.optim.AdamW(trainable_params, lr=self.cfg.exp.lr)
+
+
 def get_transforms(img_size: int, is_train: bool) -> A.Compose:
     if is_train:
         return A.Compose([
