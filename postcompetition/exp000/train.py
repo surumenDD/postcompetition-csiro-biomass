@@ -397,8 +397,6 @@ def main(cfg: Config) -> None:
     project_root = Path(HydraConfig.get().runtime.cwd)
     input_dir_path = (project_root / cfg.env.input_dir).resolve()
     train_csv_path = input_dir_path / "train.csv"
-    test_csv_path = input_dir_path / "test.csv"
-    sample_submission_csv = input_dir_path / "sample_submission.csv"
     output_root = (project_root / cfg.env.output_dir).resolve()
     exp_name = f"{Path(sys.argv[0]).parent.name}/{HydraConfig.get().runtime.choices.exp}"
     output_dir_path = output_root / exp_name
@@ -440,7 +438,108 @@ def main(cfg: Config) -> None:
         LOGGER.error("CUDA is not available. Training requires GPU.")
         raise RuntimeError("GPU (CUDA) is required but not available.")
 
-    # OOFをcsvで保存
+    # fold ループ
+    all_oof_preds: List[np.ndarray] = []
+    all_oof_targets: List[np.ndarray] = []
+    all_oof_indices: List[np.ndarray] = []
+
+    for fold in range(n_folds):
+        LOGGER.info(f"======== Fold {fold} / {n_folds} ========")
+        train_df = train_csv_wide_df[train_csv_wide_df["fold"] != fold]
+        val_df = train_csv_wide_df[train_csv_wide_df["fold"] == fold]
+
+        train_loader = DataLoader(
+            BiomassDataset(
+                train_df, input_dir_path,
+                get_transforms(cfg.exp.img_size, True),
+                TARGET_COLS,
+            ),
+            batch_size=cfg.exp.batch_size,
+            shuffle=True,
+            num_workers=cfg.exp.num_workers,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            BiomassDataset(
+                val_df, input_dir_path,
+                get_transforms(cfg.exp.img_size, False),
+                TARGET_COLS,
+            ),
+            batch_size=cfg.exp.batch_size,
+            shuffle=False,
+            num_workers=cfg.exp.num_workers,
+            pin_memory=True,
+        )
+
+        model = DualStreamDINOv3Regressor(
+            cfg.exp.model_name,
+            fusion_hidden_dim=cfg.exp.fusion_hidden_dim,
+        )
+        module = BiomassModule(model, cfg)
+        backbone_lr = cfg.exp.lr * cfg.exp.backbone_lr_ratio
+
+        fold_output_dir = output_dir_path / f"fold{fold}"
+        callbacks = [
+            GradualUnfreezeCallback(
+                cfg.exp.unfreeze_epoch,
+                cfg.exp.unfreeze_ratio,
+                backbone_lr,
+            ),
+            ModelCheckpoint(
+                dirpath=fold_output_dir,
+                monitor="val_weighted_r2",
+                mode="max",
+                save_top_k=1,
+            ),
+            LearningRateMonitor(logging_interval="epoch"),
+        ]
+        wandb_logger = WandbLogger(
+            project="csiro-biomass",
+            name=f"{exp_name}/fold{fold}",
+        )
+        trainer = pl.Trainer(
+            max_epochs=cfg.exp.num_epochs,
+            callbacks=callbacks,
+            logger=wandb_logger,
+            accelerator="gpu",
+            devices=1,
+        )
+        trainer.fit(module, train_loader, val_loader)
+
+        # ベストチェックポイントで OOF 予測
+        predictions = trainer.predict(module, val_loader, ckpt_path="best")
+        oof_preds_fold = np.concatenate([p[0] for p in predictions], axis=0)
+        oof_targets_fold = np.concatenate([p[1] for p in predictions], axis=0)
+        all_oof_preds.append(oof_preds_fold)
+        all_oof_targets.append(oof_targets_fold)
+        all_oof_indices.append(val_df.index.values)
+
+        fold_score, per_target = weighted_r2_score(
+            oof_targets_fold, oof_preds_fold)
+        LOGGER.info(f"Fold {fold} OOF weighted_r2: {fold_score:.4f}")
+        for col, r2 in zip(TARGET_COLS, per_target):
+            LOGGER.info(f"  {col}: {r2:.4f}")
+
+    # 全 fold の OOF を結合して CSV に保存
+    all_preds = np.concatenate(all_oof_preds,   axis=0)
+    all_targets = np.concatenate(all_oof_targets, axis=0)
+    all_indices = np.concatenate(all_oof_indices, axis=0)
+
+    overall_score, per_target = weighted_r2_score(all_targets, all_preds)
+    LOGGER.info(f"Overall OOF weighted_r2: {overall_score:.4f}")
+    for col, r2 in zip(TARGET_COLS, per_target):
+        LOGGER.info(f"  {col}: {r2:.4f}")
+
+    oof_df = pd.DataFrame(
+        all_preds,
+        columns=[f"pred_{c}" for c in TARGET_COLS],
+        index=all_indices,
+    )
+    for i, col in enumerate(TARGET_COLS):
+        oof_df[f"true_{col}"] = all_targets[:, i]
+    oof_csv_path = output_dir_path / "oof_predictions.csv"
+    oof_df.to_csv(oof_csv_path)
+    LOGGER.info(f"OOF predictions saved to {oof_csv_path}")
 
 
 if __name__ == "__main__":
