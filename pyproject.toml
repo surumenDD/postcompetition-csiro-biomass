@@ -26,6 +26,7 @@ dependencies = [
     # 追加ライブラリ
     "huggingface-hub>=0.36.0",
     "safetensors>=0.7.0",
+    "pytest>=9.0.2",
 ]
 
 

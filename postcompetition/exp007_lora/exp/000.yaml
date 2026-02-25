@@ -1,0 +1,32 @@
+defaults:
+  - default@_here_
+
+# large固定
+model_name: vit_large_patch16_dinov3_qkvb.lvd1689m
+img_size: 448
+
+# CV
+n_folds: 4
+seed: 42
+
+# train
+batch_size: 4
+accumulate_grad_batches: 4
+num_epochs: 25
+num_workers: 4
+
+# LR
+head_lr: 1.0e-3
+lora_lr: 5.0e-4
+weight_decay: 0.05
+
+# LoRA
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_train_last_n_blocks: 8
+lora_target_modules: ["attn.qkv", "attn.proj"]
+
+# loss
+huber_beta: 1.0

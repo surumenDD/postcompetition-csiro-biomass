@@ -51,10 +51,11 @@ class ExpConfig:
     seed: int = 42
     n_folds: int = 4
     # Model
-    model_name: str = "vit_small_patch16_dinov3_qkvb.lvd1689m"
+    model_name: str = "vit_large_patch16_dinov3_qkvb.lvd1689m"
     img_size: int = 448          # 448/16=28 → 28×28=784 patches
     # Training
-    batch_size: int = 16
+    batch_size: int = 4           # Large model: VRAM制約のため小さく
+    accumulate_grad_batches: int = 4  # 実効バッチサイズ = 4*4 = 16
     num_epochs: int = 20
     num_workers: int = 4
     lr: float = 1e-3
@@ -499,6 +500,7 @@ def main(cfg: Config) -> None:
         )
         trainer = pl.Trainer(
             max_epochs=cfg.exp.num_epochs,
+            accumulate_grad_batches=cfg.exp.accumulate_grad_batches,
             callbacks=callbacks,
             logger=wandb_logger,
             accelerator="gpu",

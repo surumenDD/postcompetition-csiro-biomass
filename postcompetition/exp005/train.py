@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import hydra
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
@@ -51,10 +52,11 @@ class ExpConfig:
     seed: int = 42
     n_folds: int = 4
     # Model
-    model_name: str = "vit_small_patch16_dinov3_qkvb.lvd1689m"
+    model_name: str = "vit_large_patch16_dinov3_qkvb.lvd1689m"
     img_size: int = 448          # 448/16=28 → 28×28=784 patches
     # Training
-    batch_size: int = 16
+    batch_size: int = 4           # Large model: VRAM制約のため小さく
+    accumulate_grad_batches: int = 4  # 実効バッチサイズ = 4*4 = 16
     num_epochs: int = 20
     num_workers: int = 4
     lr: float = 1e-3
@@ -343,7 +345,15 @@ class BiomassModule(pl.LightningModule):
             + list(self.model.fusion_trunk.parameters())
             + list(self.model.target_heads.parameters())
         )
-        return torch.optim.AdamW(trainable_params, lr=self.cfg.exp.lr)
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.cfg.exp.lr)
+        # CosineAnnealingLR でエポック終了時に lr を減衰
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=self.cfg.exp.num_epochs, eta_min=1e-6
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
 
 def get_transforms(img_size: int, is_train: bool) -> A.Compose:
@@ -351,7 +361,19 @@ def get_transforms(img_size: int, is_train: bool) -> A.Compose:
         return A.Compose([
             A.Resize(img_size, img_size),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.GaussNoise(p=0.3),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=0.75
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5
+            ),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+            A.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.75
+            ),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ])
@@ -499,6 +521,7 @@ def main(cfg: Config) -> None:
         )
         trainer = pl.Trainer(
             max_epochs=cfg.exp.num_epochs,
+            accumulate_grad_batches=cfg.exp.accumulate_grad_batches,
             callbacks=callbacks,
             logger=wandb_logger,
             accelerator="gpu",

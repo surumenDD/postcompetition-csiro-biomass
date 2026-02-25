@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import hydra
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
@@ -25,14 +26,25 @@ from utils.env import EnvConfig
 from utils.logger import get_logger
 from utils.timing import measure_time_and_memory, timer
 
-TARGET_COLS = [
+# 全5ターゲット（評価用）
+ALL_TARGET_COLS = [
     "Dry_Green_g",
     "Dry_Clover_g",
     "Dry_Dead_g",
     "GDM_g",
     "Dry_Total_g",
 ]
-TARGET_WEIGHTS = [0.1, 0.1, 0.1, 0.2, 0.5]
+ALL_TARGET_WEIGHTS = [0.1, 0.1, 0.1, 0.2, 0.5]
+
+# モデルが直接予測する3ターゲット
+# GDM_g = Green + Clover, Dry_Total_g = Green + Clover + Dead で算出
+PRED_TARGET_COLS = [
+    "Dry_Green_g",
+    "Dry_Clover_g",
+    "Dry_Dead_g",
+]
+# 予測3ターゲットに対する損失重み（均等）
+PRED_TARGET_WEIGHTS = [1.0, 1.0, 1.0]
 
 
 META_COLS = [
@@ -85,6 +97,27 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def derive_all_targets_from_pred3(pred_3: np.ndarray) -> np.ndarray:
+    """3ターゲット予測 (Green, Clover, Dead) から5ターゲットを算出する。
+
+    Parameters
+    ----------
+    pred_3 : np.ndarray, shape (N, 3)
+        列順: [Dry_Green_g, Dry_Clover_g, Dry_Dead_g]
+
+    Returns
+    -------
+    pred_5 : np.ndarray, shape (N, 5)
+        列順: [Dry_Green_g, Dry_Clover_g, Dry_Dead_g, GDM_g, Dry_Total_g]
+    """
+    green = pred_3[:, 0]
+    clover = pred_3[:, 1]
+    dead = pred_3[:, 2]
+    gdm = green + clover              # GDM = Green + Clover
+    total = green + clover + dead      # Total = Green + Clover + Dead
+    return np.column_stack([green, clover, dead, gdm, total])
 
 
 def weighted_r2_score(
@@ -213,7 +246,7 @@ class DualStreamDINOv3Regressor(nn.Module):
     def __init__(
         self,
         model_name: str,
-        num_targets: int = 5,
+        num_targets: int = 3,   # 3ターゲットのみ直接予測
         fusion_hidden_dim: int = 512,
         pretrained: bool = True,
     ):
@@ -283,14 +316,30 @@ class GradualUnfreezeCallback(pl.Callback):
         trainer.strategy.barrier()
 
 
+def _derive_5targets_from_3(pred_3: torch.Tensor) -> torch.Tensor:
+    """3ターゲット予測 (Green, Clover, Dead) から log1p 空間で5ターゲットを算出する。
+
+    log1p 逆変換 → 四則演算 → log1p 再変換 の手順で算出。
+    """
+    # log1p → 元スケール
+    raw = torch.expm1(pred_3)  # (B, 3)
+    green = raw[:, 0]
+    clover = raw[:, 1]
+    dead = raw[:, 2]
+    gdm = green + clover
+    total = green + clover + dead
+    return raw, torch.stack([green, clover, dead, gdm, total], dim=-1)  # (B, 5)
+
+
 class BiomassModule(pl.LightningModule):
     def __init__(self, model: DualStreamDINOv3Regressor, cfg: "Config"):
         super().__init__()
         self.model = model
         self.cfg = cfg
+        # 損失は予測3ターゲットのみで計算
         self.register_buffer(
-            "target_weights",
-            torch.tensor(TARGET_WEIGHTS, dtype=torch.float32)
+            "pred_target_weights",
+            torch.tensor(PRED_TARGET_WEIGHTS, dtype=torch.float32)
         )
         self._val_preds: List[np.ndarray] = []
         self._val_targets: List[np.ndarray] = []
@@ -299,28 +348,31 @@ class BiomassModule(pl.LightningModule):
         return self.model(left, right)
 
     def _weighted_loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """ターゲットごとの SmoothL1Loss を評価重みで加重平均する。"""
+        """予測3ターゲットごとの SmoothL1Loss を加重平均する。"""
         per_target_loss = torch.stack([
             nn.functional.smooth_l1_loss(pred[:, i], y[:, i])
             for i in range(pred.shape[1])
-        ])  # (5,)
-        return (per_target_loss * self.target_weights).sum()
+        ])  # (3,)
+        return (per_target_loss * self.pred_target_weights).sum()
 
     def training_step(self, batch, _):
         left, right, y = batch
-        pred = self(left, right)
-        loss = self._weighted_loss(pred, y)
+        # y: (B, 5) だが、lossは最初の3列 (Green, Clover, Dead) のみ使用
+        pred_3 = self(left, right)  # (B, 3) log1p空間
+        loss = self._weighted_loss(pred_3, y[:, :3])
         self.log("train_loss", loss, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, _):
         left, right, y = batch
-        pred = self(left, right)
-        loss = self._weighted_loss(pred, y)
+        pred_3 = self(left, right)  # (B, 3) log1p空間
+        loss = self._weighted_loss(pred_3, y[:, :3])
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        # OOF 収集（log1p 逆変換して評価）
-        self._val_preds.append(torch.expm1(pred).cpu().numpy())
-        self._val_targets.append(torch.expm1(y).cpu().numpy())
+        # OOF 収集: 3→5 変換して元スケールで評価
+        _, pred_5 = _derive_5targets_from_3(pred_3)
+        targets_5 = torch.expm1(y).cpu().numpy()  # 全5ターゲットの元スケール
+        self._val_preds.append(pred_5.cpu().numpy())
+        self._val_targets.append(targets_5)
 
     def on_validation_epoch_end(self):
         preds = np.concatenate(self._val_preds,   axis=0)
@@ -332,8 +384,10 @@ class BiomassModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         left, right, y = batch
-        pred = self(left, right)
-        return torch.expm1(pred).cpu().numpy(), torch.expm1(y).cpu().numpy()
+        pred_3 = self(left, right)
+        _, pred_5 = _derive_5targets_from_3(pred_3)
+        targets_5 = torch.expm1(y).cpu().numpy()
+        return pred_5.cpu().numpy(), targets_5
 
     def configure_optimizers(self):
         # 初期は backbone 以外（spatial_pool, trunk, 各ヘッド）のみ学習
@@ -343,7 +397,15 @@ class BiomassModule(pl.LightningModule):
             + list(self.model.fusion_trunk.parameters())
             + list(self.model.target_heads.parameters())
         )
-        return torch.optim.AdamW(trainable_params, lr=self.cfg.exp.lr)
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.cfg.exp.lr)
+        # CosineAnnealingLR でエポック終了時に lr を減衰
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=self.cfg.exp.num_epochs, eta_min=1e-6
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
 
 def get_transforms(img_size: int, is_train: bool) -> A.Compose:
@@ -351,7 +413,19 @@ def get_transforms(img_size: int, is_train: bool) -> A.Compose:
         return A.Compose([
             A.Resize(img_size, img_size),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.GaussNoise(p=0.3),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=0.75
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5
+            ),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+            A.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.75
+            ),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ])
@@ -448,11 +522,12 @@ def main(cfg: Config) -> None:
         train_df = train_csv_wide_df[train_csv_wide_df["fold"] != fold]
         val_df = train_csv_wide_df[train_csv_wide_df["fold"] == fold]
 
+        # データセットは全5ターゲットを保持（評価に必要）
         train_loader = DataLoader(
             BiomassDataset(
                 train_df, input_dir_path,
                 get_transforms(cfg.exp.img_size, True),
-                TARGET_COLS,
+                ALL_TARGET_COLS,
             ),
             batch_size=cfg.exp.batch_size,
             shuffle=True,
@@ -463,7 +538,7 @@ def main(cfg: Config) -> None:
             BiomassDataset(
                 val_df, input_dir_path,
                 get_transforms(cfg.exp.img_size, False),
-                TARGET_COLS,
+                ALL_TARGET_COLS,
             ),
             batch_size=cfg.exp.batch_size,
             shuffle=False,
@@ -473,6 +548,7 @@ def main(cfg: Config) -> None:
 
         model = DualStreamDINOv3Regressor(
             cfg.exp.model_name,
+            num_targets=3,  # 3ターゲットのみ直接予測
             fusion_hidden_dim=cfg.exp.fusion_hidden_dim,
         )
         module = BiomassModule(model, cfg)
@@ -517,7 +593,7 @@ def main(cfg: Config) -> None:
         fold_score, per_target = weighted_r2_score(
             oof_targets_fold, oof_preds_fold)
         LOGGER.info(f"Fold {fold} OOF weighted_r2: {fold_score:.4f}")
-        for col, r2 in zip(TARGET_COLS, per_target):
+        for col, r2 in zip(ALL_TARGET_COLS, per_target):
             LOGGER.info(f"  {col}: {r2:.4f}")
 
     # 全 fold の OOF を結合して CSV に保存
@@ -527,15 +603,15 @@ def main(cfg: Config) -> None:
 
     overall_score, per_target = weighted_r2_score(all_targets, all_preds)
     LOGGER.info(f"Overall OOF weighted_r2: {overall_score:.4f}")
-    for col, r2 in zip(TARGET_COLS, per_target):
+    for col, r2 in zip(ALL_TARGET_COLS, per_target):
         LOGGER.info(f"  {col}: {r2:.4f}")
 
     oof_df = pd.DataFrame(
         all_preds,
-        columns=[f"pred_{c}" for c in TARGET_COLS],
+        columns=[f"pred_{c}" for c in ALL_TARGET_COLS],
         index=all_indices,
     )
-    for i, col in enumerate(TARGET_COLS):
+    for i, col in enumerate(ALL_TARGET_COLS):
         oof_df[f"true_{col}"] = all_targets[:, i]
     oof_csv_path = output_dir_path / "oof_predictions.csv"
     oof_df.to_csv(oof_csv_path)

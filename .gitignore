@@ -148,3 +148,14 @@ data/*
 
 # claude
 CLAUDE.md
+
+# docs
+docs/*.md
+
+# exp
+postcompetition/exp001/*
+postcompetition/exp002/*
+postcompetition/exp003/*
+postcompetition/exp004/*
+postcompetition/exp005/*
+postcompetition/exp006/*
