@@ -1,0 +1,6 @@
+defaults:
+  - default@_here_
+
+img_size: 512
+num_epochs: 25
+
